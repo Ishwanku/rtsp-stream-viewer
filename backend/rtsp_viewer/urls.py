@@ -2,7 +2,7 @@
 
 from django.contrib import admin
 from django.urls import path, include
-from stream.views import home
+from stream.views import index as home
 
 urlpatterns = [
     path('', home),
