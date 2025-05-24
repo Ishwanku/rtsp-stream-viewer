@@ -5,3 +5,5 @@ python manage.py collectstatic --noinput
 curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar xJ
 mv ffmpeg-*-static/ffmpeg ./ffmpeg
 chmod +x ./ffmpeg
+# Verify FFmpeg
+./ffmpeg -version || { echo "FFmpeg download failed"; exit 1; }
