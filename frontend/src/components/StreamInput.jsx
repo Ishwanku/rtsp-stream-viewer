@@ -11,7 +11,7 @@ function StreamInput({ onAddStream }) {
     if (isLoading) return;
     setIsLoading(true);
     try {
-      const response = await axios.post('http://localhost:8000/api/stream/', { rtsp_url: rtspUrl });
+      const response = await axios.post(`${import.meta.env.VITE_BACKEND_URL}/api/stream/`, { rtsp_url: rtspUrl });
       console.log('API Response:', response.data);
       onAddStream(response.data);
       setRtspUrl('');

@@ -5,7 +5,7 @@
       "src": "rtsp_viewer/wsgi.py",
       "use": "@vercel/python",
       "config": {
-        "maxLambdaSize": "50mb",
+        "maxLambdaSize": "100mb",
         "runtime": "python3.11"
       }
     },
@@ -26,5 +26,11 @@
       "src": "/(.*)",
       "dest": "rtsp_viewer/wsgi.py"
     }
-  ]
+  ],
+  "functions": {
+    "rtsp_viewer/wsgi.py": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  }
 }
