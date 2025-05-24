@@ -35,7 +35,7 @@ class StreamView(APIView):
             except Exception as e:
                 logger.warning(f"Could not verify FFmpeg version: {str(e)}")
 
-            # Validate RTSP URL by probing
+            # Validate RTSP URL by probing with extended parameters
             logger.info("Probing RTSP URL")
             probe = ffmpeg.probe(
                 rtsp_url,
@@ -60,6 +60,7 @@ class StreamView(APIView):
                 ffmpeg
                 .input(
                     rtsp_url,
+                    re=None,  # Read at native frame rate
                     rtsp_transport='tcp',
                     analyzeduration=10000000,
                     probesize=10000000,
@@ -75,6 +76,7 @@ class StreamView(APIView):
                     vcodec='libx264',
                     acodec='aac',
                     preset='ultrafast',
+                    vsync='1',  # Synchronize video timestamps
                     loglevel='verbose'
                 )
                 .run_async(pipe_stderr=True, cmd=ffmpeg_path)
@@ -86,7 +88,7 @@ class StreamView(APIView):
             logger.info(f"Stored stream {stream_id} in Redis with PID {stream.pid}")
 
             # Wait for index.m3u8 to be generated
-            timeout = 120  # Increased to 120 seconds
+            timeout = 60  # seconds
             start_time = time.time()
             while not os.path.exists(local_output):
                 if time.time() - start_time > timeout:
@@ -127,14 +129,14 @@ class StreamView(APIView):
             logger.error(f"FFmpeg error: {error_msg}")
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id if 'stream_id' in locals() else 'unknown', 'status': 'failed', 'error': error_msg}
+                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': error_msg}
             )
             return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id if 'stream_id' in locals() else 'unknown', 'status': 'failed', 'error': str(e)}
+                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': str(e)}
             )
             return Response({'error': 'Server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -142,6 +144,7 @@ class TestRTSPView(APIView):
     def get(self, request):
         rtsp_url = request.query_params.get('rtsp_url', 'rtsp://admin:admin123@49.248.155.178:555/cam/realmonitor?channel=1&subtype=0')
         try:
+            ffmpeg_path = './ffmpeg.exe' if os.path.exists('./ffmpeg.exe') else 'ffmpeg'
             probe = ffmpeg.probe(
                 rtsp_url,
                 rtsp_transport='tcp',
@@ -165,7 +168,6 @@ class StopStreamView(APIView):
             redis_client = redis.Redis.from_url(settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0])
             pid = redis_client.get(f'stream:{stream_id}')
             if pid:
-                # Use platform-appropriate command to terminate process
                 if platform.system() == 'Windows':
                     subprocess.run(['taskkill', '/F', '/PID', pid.decode()], check=True)
                 else:
@@ -183,11 +185,8 @@ class StopStreamView(APIView):
                 response = s3_client.list_objects_v2(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Prefix=f'streams/{stream_id}/')
                 objects = [{'Key': obj['Key']} for obj in response.get('Contents', [])]
                 if objects:
-                    s3_client.delete_objects(
-                        Bucket=settings.AWS_STORAGE_BUCKET_NAME,
-                        Delete={'Objects': objects}
-                    )
-                    logger.info(f"Deleted S3 objects for stream {stream_id}")
+                    s3_client.delete_objects(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Delete={'Objects': objects})
+                logger.info(f"Deleted S3 objects for stream {stream_id}")
 
                 channel_layer = get_channel_layer()
                 async_to_sync(channel_layer.group_send)(
