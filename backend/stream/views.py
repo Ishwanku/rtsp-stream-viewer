@@ -7,6 +7,7 @@ import logging
 import subprocess
 import time
 import platform
+from urllib.parse import unquote
 from django.http import JsonResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -17,6 +18,8 @@ from channels.layers import get_channel_layer
 from decouple import config
 
 logger = logging.getLogger(__name__)
+# Set logging level to DEBUG for more detailed output
+logger.setLevel(logging.DEBUG)
 
 class StreamView(APIView):
     def post(self, request):
@@ -26,96 +29,128 @@ class StreamView(APIView):
             logger.error("RTSP URL is required")
             return Response({'error': 'RTSP URL is required'}, status=status.HTTP_400_BAD_REQUEST)
         
+        # Decode URL if it's encoded
+        rtsp_url = unquote(rtsp_url)
+        logger.debug(f"Decoded RTSP URL: {rtsp_url}")
+        
         try:
             # Determine FFmpeg path (Windows compatibility)
             ffmpeg_path = './ffmpeg.exe' if os.path.exists('./ffmpeg.exe') else 'ffmpeg'
-            try:
-                version = subprocess.check_output([ffmpeg_path, '-version'], stderr=subprocess.STDOUT).decode()
-                logger.info(f"FFmpeg version: {version.splitlines()[0]}")
-            except Exception as e:
-                logger.warning(f"Could not verify FFmpeg version: {str(e)}")
-
-            # Validate RTSP URL by probing with extended parameters
-            logger.info("Probing RTSP URL")
-            probe = ffmpeg.probe(
-                rtsp_url,
-                rtsp_transport='tcp',
-                analyzeduration=10000000,  # 10 seconds
-                probesize=10000000,       # 10 MB
-                timeout=60000000,
-                user_agent='FFmpeg'
-            )
-            logger.info(f"Probe result: {probe}")
+            logger.debug(f"Using FFmpeg path: {ffmpeg_path}")
             
             # Generate a unique stream ID
             stream_id = str(uuid.uuid4())
-            output_path = f'streams/{stream_id}/index.m3u8'
-            os.makedirs(os.path.join(settings.STATIC_ROOT, 'streams', stream_id), exist_ok=True)
-            local_output = os.path.join(settings.STATIC_ROOT, output_path)
-            logger.info(f"Local output path: {local_output}")
+            stream_dir = os.path.join(settings.MEDIA_ROOT, 'streams', stream_id)
+            os.makedirs(stream_dir, exist_ok=True)
+            output_path = os.path.join(stream_dir, 'index.m3u8')
+            logger.debug(f"Created stream directory: {stream_dir}")
             
+            try:
+                # Test RTSP connection first using direct FFmpeg command
+                logger.info("Testing RTSP connection...")
+                test_result = subprocess.run(
+                    [ffmpeg_path, '-rtsp_transport', 'tcp', '-i', rtsp_url, '-t', '1', '-f', 'null', '-'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=15
+                )
+                if test_result.returncode != 0:
+                    error_msg = test_result.stderr.decode()
+                    logger.error(f"RTSP connection test failed: {error_msg}")
+                    return Response({'error': f'Failed to connect to RTSP stream: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
+                logger.info("RTSP connection test successful")
+            except subprocess.TimeoutExpired:
+                logger.error("RTSP connection test timed out")
+                return Response({'error': 'Connection timeout'}, status=status.HTTP_408_REQUEST_TIMEOUT)
+            except Exception as e:
+                logger.error(f"Error testing RTSP connection: {str(e)}")
+                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
             # Start FFmpeg process to convert RTSP to HLS
             logger.info("Starting FFmpeg process")
-            stream = (
-                ffmpeg
-                .input(
-                    rtsp_url,
-                    re=None,  # Read at native frame rate
-                    rtsp_transport='tcp',
-                    analyzeduration=10000000,
-                    probesize=10000000,
-                    timeout=60000000,
-                    user_agent='FFmpeg'
+            try:
+                stream = (
+                    ffmpeg
+                    .input(
+                        rtsp_url,
+                        rtsp_transport='tcp',
+                        analyzeduration='1000000',  # Reduced from 10000000
+                        probesize='1000000',        # Reduced from 10000000
+                        timeout='10000000',         # Reduced from 60000000
+                        user_agent='FFmpeg',
+                        loglevel='debug',
+                        reorder_queue_size='0',     # Disable reordering
+                        max_delay='500000',         # Maximum delay in microseconds
+                        flags='low_delay'           # Enable low delay mode
+                    )
+                    .output(
+                        output_path,
+                        format='hls',
+                        hls_time=1,                 # Reduced segment time
+                        hls_list_size=2,            # Reduced list size
+                        hls_flags='delete_segments+append_list',  # Added append_list
+                        hls_segment_filename=os.path.join(stream_dir, '%03d.ts'),
+                        vcodec='libx264',
+                        acodec='aac',
+                        preset='ultrafast',
+                        tune='zerolatency',
+                        vsync='1',
+                        g=15,                       # Reduced GOP size
+                        keyint_min=15,              # Minimum keyframe interval
+                        sc_threshold=0,             # Scene change threshold
+                        bf=0,                       # No B-frames
+                        maxrate='1000k',            # Maximum bitrate
+                        bufsize='2000k',            # Buffer size
+                        threads=4,                  # Number of threads
+                        fflags='nobuffer+fastseek', # Disable buffering
+                        flags='low_delay'           # Enable low delay mode
+                    )
+                    .overwrite_output()
+                    .run_async(pipe_stderr=True, cmd=ffmpeg_path)
                 )
-                .output(
-                    local_output,
-                    format='hls',
-                    hls_time=2,
-                    hls_list_size=3,
-                    hls_segment_filename=os.path.join(settings.STATIC_ROOT, f'streams/{stream_id}/%03d.ts'),
-                    vcodec='libx264',
-                    acodec='aac',
-                    preset='ultrafast',
-                    vsync='1',  # Synchronize video timestamps
-                    loglevel='verbose'
-                )
-                .run_async(pipe_stderr=True, cmd=ffmpeg_path)
-            )
+            except ffmpeg.Error as e:
+                error_msg = e.stderr.decode() if e.stderr else str(e)
+                logger.error(f"FFmpeg error while starting stream: {error_msg}")
+                return Response({'error': f'Failed to start stream: {error_msg}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            # Store process in Redis
-            redis_client = redis.Redis.from_url(settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0])
-            redis_client.set(f'stream:{stream_id}', stream.pid, ex=3600)
-            logger.info(f"Stored stream {stream_id} in Redis with PID {stream.pid}")
+            # Store process ID in memory
+            if not hasattr(StreamView, '_processes'):
+                StreamView._processes = {}
+            StreamView._processes[stream_id] = stream.pid
+            logger.debug(f"Started FFmpeg process with PID: {stream.pid}")
 
             # Wait for index.m3u8 to be generated
-            timeout = 60  # seconds
+            timeout = 15  # reduced timeout to 15 seconds
             start_time = time.time()
-            while not os.path.exists(local_output):
+            while not os.path.exists(output_path):
                 if time.time() - start_time > timeout:
                     stream.terminate()
-                    redis_client.delete(f'stream:{stream_id}')
+                    if stream_id in StreamView._processes:
+                        del StreamView._processes[stream_id]
                     logger.error("Timeout waiting for index.m3u8")
+                    # Clean up stream directory
+                    try:
+                        for file in os.listdir(stream_dir):
+                            os.remove(os.path.join(stream_dir, file))
+                        os.rmdir(stream_dir)
+                    except Exception as e:
+                        logger.error(f"Error cleaning up stream directory: {str(e)}")
                     return Response({'error': 'FFmpeg failed to generate HLS playlist within timeout'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-                time.sleep(1)
+                time.sleep(0.1)  # Reduced sleep time
+                # Check if FFmpeg process is still running
+                if stream.poll() is not None:
+                    stderr_output = stream.stderr.read().decode() if stream.stderr else "No error output available"
+                    logger.error(f"FFmpeg process exited prematurely. Error: {stderr_output}")
+                    return Response({'error': f'FFmpeg process failed: {stderr_output}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
-            # Upload HLS files to S3
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=config('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=config('AWS_SECRET_ACCESS_KEY'),
-                region_name=config('AWS_S3_REGION_NAME')
-            )
-            for file in os.listdir(os.path.join(settings.STATIC_ROOT, f'streams/{stream_id}')):
-                local_file = os.path.join(settings.STATIC_ROOT, f'streams/{stream_id}', file)
-                s3_key = f'streams/{stream_id}/{file}'
-                s3.upload_file(local_file, settings.AWS_STORAGE_BUCKET_NAME, s3_key)
-                logger.info(f"Uploaded {local_file} to S3: {s3_key}")
+            logger.info(f"HLS playlist generated: {output_path}")
 
             # Notify frontend via WebSocket
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
                 'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'connected'}
             )
+            logger.debug("Sent WebSocket notification")
 
             stream_url = f'{settings.HLS_URL}{stream_id}/index.m3u8'
             logger.info(f"Stream URL generated: {stream_url}")
@@ -124,39 +159,33 @@ class StreamView(APIView):
                 'stream_url': stream_url
             }, status=status.HTTP_200_OK)
             
-        except ffmpeg.Error as e:
-            error_msg = e.stderr.decode() if e.stderr else str(e)
-            logger.error(f"FFmpeg error: {error_msg}")
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': error_msg}
-            )
-            return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
-            channel_layer = get_channel_layer()
-            async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': str(e)}
-            )
-            return Response({'error': 'Server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TestRTSPView(APIView):
     def get(self, request):
-        rtsp_url = request.query_params.get('rtsp_url', 'rtsp://admin:admin123@49.248.155.178:555/cam/realmonitor?channel=1&subtype=0')
+        rtsp_url = request.query_params.get('rtsp_url')
+        if not rtsp_url:
+            return Response({'error': 'RTSP URL is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
         try:
             ffmpeg_path = './ffmpeg.exe' if os.path.exists('./ffmpeg.exe') else 'ffmpeg'
-            probe = ffmpeg.probe(
-                rtsp_url,
-                rtsp_transport='tcp',
-                analyzeduration=10000000,
-                probesize=10000000,
-                timeout=60000000,
-                user_agent='FFmpeg'
+            # Test RTSP connection using FFmpeg directly
+            result = subprocess.run(
+                [ffmpeg_path, '-rtsp_transport', 'tcp', '-i', rtsp_url, '-t', '1', '-f', 'null', '-'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
             )
-            return Response({'probe': probe}, status=status.HTTP_200_OK)
-        except ffmpeg.Error as e:
-            error_msg = e.stderr.decode() if e.stderr else str(e)
-            return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
+            if result.returncode == 0:
+                return Response({'status': 'success'}, status=status.HTTP_200_OK)
+            else:
+                return Response({'error': result.stderr.decode()}, status=status.HTTP_400_BAD_REQUEST)
+        except subprocess.TimeoutExpired:
+            return Response({'error': 'Connection timeout'}, status=status.HTTP_408_REQUEST_TIMEOUT)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class StopStreamView(APIView):
     def post(self, request):
@@ -165,29 +194,22 @@ class StopStreamView(APIView):
             return Response({'error': 'Stream ID is required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            redis_client = redis.Redis.from_url(settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0])
-            pid = redis_client.get(f'stream:{stream_id}')
-            if pid:
+            if hasattr(StreamView, '_processes') and stream_id in StreamView._processes:
+                pid = StreamView._processes[stream_id]
                 if platform.system() == 'Windows':
-                    subprocess.run(['taskkill', '/F', '/PID', pid.decode()], check=True)
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid)], check=True)
                 else:
-                    subprocess.run(['kill', '-9', pid.decode()], check=True)
-                redis_client.delete(f'stream:{stream_id}')
-                logger.info(f"Stopped stream {stream_id} with PID {pid.decode()}")
+                    subprocess.run(['kill', '-9', str(pid)], check=True)
+                del StreamView._processes[stream_id]
+                
+                # Clean up stream directory
+                stream_dir = os.path.join(settings.MEDIA_ROOT, 'streams', stream_id)
+                if os.path.exists(stream_dir):
+                    for file in os.listdir(stream_dir):
+                        os.remove(os.path.join(stream_dir, file))
+                    os.rmdir(stream_dir)
 
-                # Delete HLS files from S3
-                s3_client = boto3.client(
-                    's3',
-                    aws_access_key_id=config('AWS_ACCESS_KEY_ID'),
-                    aws_secret_access_key=config('AWS_SECRET_ACCESS_KEY'),
-                    region_name=config('AWS_S3_REGION_NAME')
-                )
-                response = s3_client.list_objects_v2(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Prefix=f'streams/{stream_id}/')
-                objects = [{'Key': obj['Key']} for obj in response.get('Contents', [])]
-                if objects:
-                    s3_client.delete_objects(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Delete={'Objects': objects})
-                logger.info(f"Deleted S3 objects for stream {stream_id}")
-
+                # Notify frontend
                 channel_layer = get_channel_layer()
                 async_to_sync(channel_layer.group_send)(
                     'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'stopped'}

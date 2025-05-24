@@ -9,17 +9,33 @@ function StreamInput({ onAddStream }) {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (isLoading) return;
+    
     setIsLoading(true);
+    setError('');
+    
+    const backendUrl = import.meta.env.VITE_BACKEND_URL;
+    console.log('Backend URL:', backendUrl);
+    console.log('RTSP URL:', rtspUrl);
+    
     try {
-      const response = await axios.post(`${import.meta.env.VITE_BACKEND_URL}/api/stream/`, { rtsp_url: rtspUrl });
+      const response = await axios.post(`${backendUrl}/api/stream/`, 
+        { rtsp_url: rtspUrl },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          withCredentials: true
+        }
+      );
+      
       console.log('API Response:', response.data);
       onAddStream(response.data);
       setRtspUrl('');
       setError('');
     } catch (err) {
-      const errorMsg = err.response?.data?.error || 'Failed to add stream. Please check the URL or network.';
+      console.error('Stream error:', err);
+      const errorMsg = err.response?.data?.error || err.message || 'Failed to add stream. Please check the URL or network.';
       setError(errorMsg);
-      console.error('Stream error:', errorMsg);
     } finally {
       setIsLoading(false);
     }
