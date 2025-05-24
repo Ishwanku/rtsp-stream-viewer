@@ -1,3 +1,4 @@
+from django.http import JsonResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -88,3 +89,6 @@ class TestRTSPView(APIView):
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
             return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
+
+def status_view(request):
+    return JsonResponse({"status": "Backend running"})
