@@ -4,17 +4,32 @@
     {
       "src": "rtsp_viewer/wsgi.py",
       "use": "@vercel/python",
-      "config": { "maxLambdaSize": "50mb" }
+      "config": {
+        "maxLambdaSize": "100mb",
+        "runtime": "python3.11"
+      }
+    },
+    {
+      "src": "build.sh",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "static"
+      }
     }
   ],
   "routes": [
     {
-      "src": "/api/(.*)",
-      "dest": "rtsp_viewer/wsgi.py"
-    },
-    {
       "src": "/static/(.*)",
       "dest": "/static/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "rtsp_viewer/wsgi.py"
     }
-  ]
+  ],
+  "functions": {
+    "rtsp_viewer/wsgi.py": {
+      "maxDuration": 60
+    }
+  }
 }

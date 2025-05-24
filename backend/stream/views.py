@@ -4,6 +4,8 @@ from rest_framework import status
 import ffmpeg
 import os
 import logging
+import subprocess
+import time
 from decouple import config
 
 logger = logging.getLogger(__name__)
@@ -17,9 +19,17 @@ class StreamView(APIView):
             return Response({'error': 'RTSP URL is required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
+            # Log FFmpeg version for debugging
+            ffmpeg_path = './ffmpeg' if os.path.exists('./ffmpeg') else 'ffmpeg'
+            try:
+                version = subprocess.check_output([ffmpeg_path, '-version'], stderr=subprocess.STDOUT).decode()
+                logger.info(f"FFmpeg version: {version.splitlines()[0]}")
+            except Exception as e:
+                logger.warning(f"Could not verify FFmpeg version: {str(e)}")
+
             # Validate RTSP URL by probing
             logger.info("Probing RTSP URL")
-            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=30000000, user_agent='FFmpeg')
+            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
             logger.info(f"Probe result: {probe}")
             
             # Generate a unique stream ID
@@ -32,16 +42,27 @@ class StreamView(APIView):
             logger.info("Starting FFmpeg process")
             stream = (
                 ffmpeg
-                .input(rtsp_url, rtsp_transport='tcp', timeout=30000000, user_agent='FFmpeg')
-                .output(output_path, format='hls', hls_time=10, hls_list_size=3, hls_segment_filename=f'static/streams/{stream_id}/%03d.ts', vcodec='libx264', acodec='aac', preset='ultrafast')
-                .run_async(pipe_stderr=True)
+                .input(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
+                .output(output_path, format='hls', hls_time=10, hls_list_size=3, hls_segment_filename=f'static/streams/{stream_id}/%03d.ts', vcodec='libx264', acodec='aac', preset='ultrafast', loglevel='verbose')
+                .run_async(pipe_stderr=True, cmd=ffmpeg_path)
             )
-            # Read initial stderr to catch early errors
-            stderr = stream.stderr.read(1024).decode()
-            if stderr:
-                logger.error(f"FFmpeg initial stderr: {stderr}")
-                if "Connection to" in stderr or "Error number -138" in stderr:
-                    return Response({'error': 'Failed to connect to RTSP server. Check URL or network.'}, status=status.HTTP_400_BAD_REQUEST)
+            # Wait for index.m3u8 to be generated
+            timeout = 60  # seconds
+            start_time = time.time()
+            while not os.path.exists(output_path):
+                if time.time() - start_time > timeout:
+                    stream.terminate()
+                    logger.error("Timeout waiting for index.m3u8")
+                    return Response({'error': 'FFmpeg failed to generate HLS playlist within timeout'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                time.sleep(1)
+            
+            # Read FFmpeg stderr for errors
+            stderr = stream.stderr.read(4096).decode()
+            if stderr and ("Error" in stderr or "fail" in stderr.lower()):
+                logger.error(f"FFmpeg stderr: {stderr}")
+                stream.terminate()
+                return Response({'error': f'FFmpeg error: {stderr}'}, status=status.HTTP_400_BAD_REQUEST)
+            logger.info(f"FFmpeg stderr: {stderr}")
             
             stream_url = f'/static/streams/{stream_id}/index.m3u8'
             logger.info(f"Stream URL generated: {stream_url}")
@@ -53,8 +74,6 @@ class StreamView(APIView):
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
             logger.error(f"FFmpeg error: {error_msg}")
-            if "Connection to" in error_msg or "Error number -138" in error_msg:
-                error_msg = 'Failed to connect to RTSP server. Check URL or network.'
             return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
@@ -62,12 +81,10 @@ class StreamView(APIView):
 
 class TestRTSPView(APIView):
     def get(self, request):
-        rtsp_url = request.query_params.get('rtsp_url', 'rtsp://freja.hiof.no:1935/rtplive/definst/hessdalen03.stream')
+        rtsp_url = request.query_params.get('rtsp_url', 'rtsp://admin:admin123@49.248.155.178:555/cam/realmonitor?channel=1&subtype=0')
         try:
-            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=30000000, user_agent='FFmpeg')
+            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
             return Response({'probe': probe}, status=status.HTTP_200_OK)
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
-            if "Connection to" in error_msg or "Error number -138" in error_msg:
-                error_msg = 'Failed to connect to RTSP server. Check URL or network.'
-            return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
