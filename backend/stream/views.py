@@ -6,6 +6,7 @@ import boto3
 import logging
 import subprocess
 import time
+import platform
 from django.http import JsonResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -26,8 +27,8 @@ class StreamView(APIView):
             return Response({'error': 'RTSP URL is required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Log FFmpeg version for debugging
-            ffmpeg_path = './ffmpeg' if os.path.exists('./ffmpeg') else 'ffmpeg'
+            # Determine FFmpeg path (Windows compatibility)
+            ffmpeg_path = './ffmpeg.exe' if os.path.exists('./ffmpeg.exe') else 'ffmpeg'
             try:
                 version = subprocess.check_output([ffmpeg_path, '-version'], stderr=subprocess.STDOUT).decode()
                 logger.info(f"FFmpeg version: {version.splitlines()[0]}")
@@ -36,7 +37,14 @@ class StreamView(APIView):
 
             # Validate RTSP URL by probing
             logger.info("Probing RTSP URL")
-            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
+            probe = ffmpeg.probe(
+                rtsp_url,
+                rtsp_transport='tcp',
+                analyzeduration=10000000,  # 10 seconds
+                probesize=10000000,       # 10 MB
+                timeout=60000000,
+                user_agent='FFmpeg'
+            )
             logger.info(f"Probe result: {probe}")
             
             # Generate a unique stream ID
@@ -50,7 +58,14 @@ class StreamView(APIView):
             logger.info("Starting FFmpeg process")
             stream = (
                 ffmpeg
-                .input(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
+                .input(
+                    rtsp_url,
+                    rtsp_transport='tcp',
+                    analyzeduration=10000000,
+                    probesize=10000000,
+                    timeout=60000000,
+                    user_agent='FFmpeg'
+                )
                 .output(
                     local_output,
                     format='hls',
@@ -71,7 +86,7 @@ class StreamView(APIView):
             logger.info(f"Stored stream {stream_id} in Redis with PID {stream.pid}")
 
             # Wait for index.m3u8 to be generated
-            timeout = 60  # seconds
+            timeout = 120  # Increased to 120 seconds
             start_time = time.time()
             while not os.path.exists(local_output):
                 if time.time() - start_time > timeout:
@@ -81,8 +96,6 @@ class StreamView(APIView):
                     return Response({'error': 'FFmpeg failed to generate HLS playlist within timeout'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
                 time.sleep(1)
             
-            
-
             # Upload HLS files to S3
             s3 = boto3.client(
                 's3',
@@ -114,14 +127,14 @@ class StreamView(APIView):
             logger.error(f"FFmpeg error: {error_msg}")
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': error_msg}
+                'streams', {'type': 'stream_update', 'stream_id': stream_id if 'stream_id' in locals() else 'unknown', 'status': 'failed', 'error': error_msg}
             )
             return Response({'error': f'FFmpeg failed: {error_msg}'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
             channel_layer = get_channel_layer()
             async_to_sync(channel_layer.group_send)(
-                'streams', {'type': 'stream_update', 'stream_id': stream_id, 'status': 'failed', 'error': str(e)}
+                'streams', {'type': 'stream_update', 'stream_id': stream_id if 'stream_id' in locals() else 'unknown', 'status': 'failed', 'error': str(e)}
             )
             return Response({'error': 'Server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -129,7 +142,14 @@ class TestRTSPView(APIView):
     def get(self, request):
         rtsp_url = request.query_params.get('rtsp_url', 'rtsp://admin:admin123@49.248.155.178:555/cam/realmonitor?channel=1&subtype=0')
         try:
-            probe = ffmpeg.probe(rtsp_url, rtsp_transport='tcp', timeout=60000000, user_agent='FFmpeg')
+            probe = ffmpeg.probe(
+                rtsp_url,
+                rtsp_transport='tcp',
+                analyzeduration=10000000,
+                probesize=10000000,
+                timeout=60000000,
+                user_agent='FFmpeg'
+            )
             return Response({'probe': probe}, status=status.HTTP_200_OK)
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
@@ -145,7 +165,11 @@ class StopStreamView(APIView):
             redis_client = redis.Redis.from_url(settings.CHANNEL_LAYERS['default']['CONFIG']['hosts'][0])
             pid = redis_client.get(f'stream:{stream_id}')
             if pid:
-                subprocess.run(['kill', '-9', pid.decode()])
+                # Use platform-appropriate command to terminate process
+                if platform.system() == 'Windows':
+                    subprocess.run(['taskkill', '/F', '/PID', pid.decode()], check=True)
+                else:
+                    subprocess.run(['kill', '-9', pid.decode()], check=True)
                 redis_client.delete(f'stream:{stream_id}')
                 logger.info(f"Stopped stream {stream_id} with PID {pid.decode()}")
 
@@ -156,11 +180,14 @@ class StopStreamView(APIView):
                     aws_secret_access_key=config('AWS_SECRET_ACCESS_KEY'),
                     region_name=config('AWS_S3_REGION_NAME')
                 )
-                s3_client.delete_objects(
-                    Bucket=settings.AWS_STORAGE_BUCKET_NAME,
-                    Delete={'Objects': [{'Key': f'streams/{stream_id}/{f}'} for f in s3_client.list_objects_v2(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Prefix=f'streams/{stream_id}/').get('Contents', [{'Key': ''}]) if 'Key' in f]}
-                )
-                logger.info(f"Deleted S3 objects for stream {stream_id}")
+                response = s3_client.list_objects_v2(Bucket=settings.AWS_STORAGE_BUCKET_NAME, Prefix=f'streams/{stream_id}/')
+                objects = [{'Key': obj['Key']} for obj in response.get('Contents', [])]
+                if objects:
+                    s3_client.delete_objects(
+                        Bucket=settings.AWS_STORAGE_BUCKET_NAME,
+                        Delete={'Objects': objects}
+                    )
+                    logger.info(f"Deleted S3 objects for stream {stream_id}")
 
                 channel_layer = get_channel_layer()
                 async_to_sync(channel_layer.group_send)(

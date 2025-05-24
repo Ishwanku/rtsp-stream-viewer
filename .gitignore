@@ -5,9 +5,32 @@ __pycache__/
 venv/
 .env
 *.sqlite3
+/backend/staticfiles/
+/backend/media/
 
 # Node.js/React
 node_modules/
 dist/
 *.log
 .env.local
+/frontend/build/
+/frontend/.env
+/frontend/.env.development.local
+/frontend/.env.test.local
+/frontend/.env.production.local
+
+# FFmpeg executable
+backend/ffmpeg.exe
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
