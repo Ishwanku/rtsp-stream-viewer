@@ -8,14 +8,12 @@ import subprocess
 import time
 import platform
 from urllib.parse import unquote
-from django.http import JsonResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.conf import settings
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from decouple import config
 
 # Configure logging
 logging.basicConfig(
